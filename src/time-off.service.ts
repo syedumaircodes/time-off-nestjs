@@ -27,9 +27,13 @@ export class TimeOffService {
     private balanceRepo: Repository<LeaveBalance>,
     @InjectRepository(TimeOffRequest)
     private requestRepo: Repository<TimeOffRequest>,
-    @InjectRepository(SyncLog) private syncLogRepo: Repository<SyncLog>,
+    @InjectRepository(SyncLog)
+    private syncLogRepo: Repository<SyncLog>,
   ) {}
 
+  /**
+   * TRD 3.1 & 4.3: Concurrency Control via Manual Optimistic Locking
+   */
   async submitRequest(
     employeeId: string,
     locationId: string,
@@ -43,12 +47,12 @@ export class TimeOffService {
       if (existing) return existing;
     }
 
-    const maxRetries = 5; // Increased retries for high contention
+    const maxRetries = 5;
     let attempt = 0;
 
     while (attempt < maxRetries) {
       try {
-        // Always fetch a FRESH copy from the DB at the start of the loop
+        // 1. Fetch fresh balance
         let balance = await this.balanceRepo.findOne({
           where: { employeeId, locationId },
         });
@@ -64,7 +68,6 @@ export class TimeOffService {
               }),
             );
           } catch (e) {
-            // If another request created it while we were trying, fetch that one
             balance = await this.balanceRepo.findOne({
               where: { employeeId, locationId },
             });
@@ -72,17 +75,24 @@ export class TimeOffService {
           }
         }
 
+        // 2. Local Validation (Layer 1)
         const effectiveBalance = balance.availableDays - balance.reservedDays;
         if (effectiveBalance < days) {
           throw new BadRequestException('Insufficient balance');
         }
 
-        // Increment locally
-        balance.reservedDays += days;
+        // 3. ATOMIC UPDATE with Version Check
+        // This ensures that if another request changed the version, affected will be 0
+        const updateResult = await this.balanceRepo.update(
+          { id: balance.id, version: balance.version },
+          { reservedDays: balance.reservedDays + days },
+        );
 
-        // Save using TypeORM's built-in Optimistic Locking (@Version column)
-        await this.balanceRepo.save(balance);
+        if (updateResult.affected === 0) {
+          throw new Error('VERSION_MISMATCH');
+        }
 
+        // 4. Create Request record
         const request = this.requestRepo.create({
           id: requestId,
           employeeId,
@@ -93,24 +103,26 @@ export class TimeOffService {
 
         return await this.requestRepo.save(request);
       } catch (error) {
-        // If the version changed between our Read and our Write, retry the logic
         if (
-          error.name === 'OptimisticLockVersionMismatchError' ||
+          error.message === 'VERSION_MISMATCH' ||
           error.code === 'SQLITE_CONSTRAINT'
         ) {
           attempt++;
-          // Small delay to let the other request finish
-          await new Promise((resolve) => setTimeout(resolve, 10 * attempt));
+          // Wait briefly to allow the other request to finish
+          await new Promise((resolve) => setTimeout(resolve, 20 * attempt));
           continue;
         }
-        throw error;
+        throw error; // Rethrow actual BadRequestExceptions (400)
       }
     }
     throw new ConflictException(
-      'High contention on balance update. Please try again.',
+      'High contention on balance. Please try again.',
     );
   }
 
+  /**
+   * TRD 4.4: Approval with Defensive re-verification
+   */
   async approveRequest(requestId: string) {
     const request = await this.requestRepo.findOne({
       where: { id: requestId },
@@ -118,17 +130,17 @@ export class TimeOffService {
     if (!request || request.status !== RequestStatus.PENDING)
       throw new BadRequestException('Invalid request');
 
-    // Fetch fresh balance
     const balance = await this.balanceRepo.findOne({
       where: { employeeId: request.employeeId, locationId: request.locationId },
     });
     if (!balance) throw new NotFoundException('Balance not found');
 
     try {
-      // Layer 2: Re-verify
+      // Layer 2: Real-time re-verify with HCM
       const hcmRes = await axios.get(
         `${this.HCM_URL}/balances/${request.employeeId}/${request.locationId}`,
       );
+
       if (hcmRes.data.balance < request.daysRequested) {
         request.status = RequestStatus.FAILED;
         balance.reservedDays -= request.daysRequested;
@@ -136,7 +148,7 @@ export class TimeOffService {
         return await this.requestRepo.save(request);
       }
 
-      // Layer 3: Deduct
+      // Layer 3: File to HCM
       await axios.post(`${this.HCM_URL}/time-off`, {
         employeeId: request.employeeId,
         locationId: request.locationId,
@@ -151,7 +163,7 @@ export class TimeOffService {
       if (error.response?.status === 400) {
         throw new BadGatewayException('HCM rejected request (400)');
       }
-      // TRD 4.6 Resilience
+      // TRD 4.6 Resilience/Optimistic Approval
       this.logger.warn(`HCM Down. Optimistic Approval for ${requestId}`);
       request.status = RequestStatus.APPROVED;
       request.hcmFiled = false;
@@ -172,19 +184,20 @@ export class TimeOffService {
       });
 
       if (!local) {
-        local = this.balanceRepo.create({
-          employeeId: item.employeeId,
-          locationId: item.locationId,
-          availableDays: item.balance,
-          reservedDays: 0,
-        });
-        await this.balanceRepo.save(local);
+        local = await this.balanceRepo.save(
+          this.balanceRepo.create({
+            employeeId: item.employeeId,
+            locationId: item.locationId,
+            availableDays: item.balance,
+            reservedDays: 0,
+          }),
+        );
       } else {
         local.availableDays = item.balance;
         await this.balanceRepo.save(local);
       }
 
-      // TRD 4.5 Auto-fail invalid pending requests
+      // TRD 4.5 Auto-fail pending requests if balance was reduced
       const pendings = await this.requestRepo.find({
         where: {
           employeeId: item.employeeId,
@@ -225,6 +238,19 @@ export class TimeOffService {
     }
   }
 
+  async manualSync(employeeId: string, locationId: string) {
+    const res = await axios.get(
+      `${this.HCM_URL}/balances/${employeeId}/${locationId}`,
+    );
+    let balance = await this.balanceRepo.findOne({
+      where: { employeeId, locationId },
+    });
+    if (!balance) balance = this.balanceRepo.create({ employeeId, locationId });
+    balance.availableDays = res.data.balance;
+    balance.lastSyncedAt = new Date();
+    return await this.balanceRepo.save(balance);
+  }
+
   async getEmployeeBalances(employeeId: string) {
     return this.balanceRepo.find({ where: { employeeId } });
   }
@@ -249,40 +275,5 @@ export class TimeOffService {
   }
   async cancelRequest(requestId: string) {
     return this.rejectRequest(requestId);
-  }
-  /**
-   * TRD 5.3: Manual real-time sync (Admin/System use)
-   * Fetches balance directly from HCM and updates the local cache.
-   */
-  async manualSync(employeeId: string, locationId: string) {
-    try {
-      const res = await axios.get(
-        `${this.HCM_URL}/balances/${employeeId}/${locationId}`,
-      );
-      const hcmBalance = res.data.balance;
-
-      let localBalance = await this.balanceRepo.findOne({
-        where: { employeeId, locationId },
-      });
-
-      if (!localBalance) {
-        localBalance = this.balanceRepo.create({
-          employeeId,
-          locationId,
-          availableDays: hcmBalance,
-          reservedDays: 0,
-        });
-      } else {
-        localBalance.availableDays = hcmBalance;
-      }
-
-      localBalance.lastSyncedAt = new Date();
-      return await this.balanceRepo.save(localBalance);
-    } catch (error) {
-      this.logger.error(
-        `Manual sync failed for ${employeeId}: ${error.message}`,
-      );
-      throw new BadGatewayException('Could not synchronize with HCM system');
-    }
   }
 }
