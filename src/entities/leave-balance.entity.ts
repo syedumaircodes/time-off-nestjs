@@ -19,14 +19,14 @@ export class LeaveBalance {
   locationId: string;
 
   @Column({ type: 'float', default: 0 })
-  availableDays: number; // Current balance from HCM
+  availableDays: number;
 
   @Column({ type: 'float', default: 0 })
-  reservedDays: number; // Logic: Held for PENDING requests
+  reservedDays: number;
 
   @Column({ type: 'datetime', nullable: true })
   lastSyncedAt: Date;
 
-  @VersionColumn() // This enables the automatic optimistic locking
+  @VersionColumn() // This is critical for the Concurrency test
   version: number;
 }

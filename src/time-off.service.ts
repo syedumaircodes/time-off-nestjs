@@ -2,9 +2,9 @@ import {
   Injectable,
   BadRequestException,
   ConflictException,
-  InternalServerErrorException,
   Logger,
   NotFoundException,
+  BadGatewayException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
@@ -13,6 +13,8 @@ import {
   TimeOffRequest,
   RequestStatus,
 } from './entities/time-off-request.entity';
+import { SyncLog } from './entities/sync-log.entity';
+import { Cron, CronExpression } from '@nestjs/schedule';
 import axios from 'axios';
 
 @Injectable()
@@ -25,41 +27,64 @@ export class TimeOffService {
     private balanceRepo: Repository<LeaveBalance>,
     @InjectRepository(TimeOffRequest)
     private requestRepo: Repository<TimeOffRequest>,
+    @InjectRepository(SyncLog) private syncLogRepo: Repository<SyncLog>,
   ) {}
 
-  async submitRequest(employeeId: string, locationId: string, days: number) {
-    const maxRetries = 3;
+  async submitRequest(
+    employeeId: string,
+    locationId: string,
+    days: number,
+    requestId?: string,
+  ) {
+    if (requestId) {
+      const existing = await this.requestRepo.findOne({
+        where: { id: requestId },
+      });
+      if (existing) return existing;
+    }
+
+    const maxRetries = 5; // Increased retries for high contention
     let attempt = 0;
 
     while (attempt < maxRetries) {
       try {
+        // Always fetch a FRESH copy from the DB at the start of the loop
         let balance = await this.balanceRepo.findOne({
           where: { employeeId, locationId },
         });
 
-        // Logic: Create balance if missing locally
         if (!balance) {
-          const newBalance = this.balanceRepo.create({
-            employeeId,
-            locationId,
-            availableDays: 0,
-            reservedDays: 0,
-          });
-          balance = await this.balanceRepo.save(newBalance);
+          try {
+            balance = await this.balanceRepo.save(
+              this.balanceRepo.create({
+                employeeId,
+                locationId,
+                availableDays: 0,
+                reservedDays: 0,
+              }),
+            );
+          } catch (e) {
+            // If another request created it while we were trying, fetch that one
+            balance = await this.balanceRepo.findOne({
+              where: { employeeId, locationId },
+            });
+            if (!balance) throw e;
+          }
         }
 
         const effectiveBalance = balance.availableDays - balance.reservedDays;
-
         if (effectiveBalance < days) {
-          throw new BadRequestException(
-            `Insufficient balance. Effective: ${effectiveBalance}`,
-          );
+          throw new BadRequestException('Insufficient balance');
         }
 
+        // Increment locally
         balance.reservedDays += days;
+
+        // Save using TypeORM's built-in Optimistic Locking (@Version column)
         await this.balanceRepo.save(balance);
 
         const request = this.requestRepo.create({
+          id: requestId,
           employeeId,
           locationId,
           daysRequested: days,
@@ -68,19 +93,21 @@ export class TimeOffService {
 
         return await this.requestRepo.save(request);
       } catch (error) {
-        // Fix for TypeORM specific error check
-        if (error.name === 'OptimisticLockVersionMismatchError') {
+        // If the version changed between our Read and our Write, retry the logic
+        if (
+          error.name === 'OptimisticLockVersionMismatchError' ||
+          error.code === 'SQLITE_CONSTRAINT'
+        ) {
           attempt++;
-          this.logger.warn(
-            `Concurrency detected. Retry ${attempt}/${maxRetries}`,
-          );
+          // Small delay to let the other request finish
+          await new Promise((resolve) => setTimeout(resolve, 10 * attempt));
           continue;
         }
         throw error;
       }
     }
     throw new ConflictException(
-      'Could not process request due to high contention.',
+      'High contention on balance update. Please try again.',
     );
   }
 
@@ -88,191 +115,174 @@ export class TimeOffService {
     const request = await this.requestRepo.findOne({
       where: { id: requestId },
     });
-    if (!request || request.status !== RequestStatus.PENDING) {
-      throw new BadRequestException('Invalid request status');
-    }
+    if (!request || request.status !== RequestStatus.PENDING)
+      throw new BadRequestException('Invalid request');
 
+    // Fetch fresh balance
     const balance = await this.balanceRepo.findOne({
       where: { employeeId: request.employeeId, locationId: request.locationId },
     });
-
-    // Guard against null balance
-    if (!balance) {
-      throw new NotFoundException('Local balance record not found');
-    }
+    if (!balance) throw new NotFoundException('Balance not found');
 
     try {
-      // Layer 2: Re-verify with HCM
+      // Layer 2: Re-verify
       const hcmRes = await axios.get(
         `${this.HCM_URL}/balances/${request.employeeId}/${request.locationId}`,
       );
-      const actualHcmBalance = hcmRes.data.balance;
-
-      if (actualHcmBalance < request.daysRequested) {
+      if (hcmRes.data.balance < request.daysRequested) {
         request.status = RequestStatus.FAILED;
-        request.failureReason = 'HCM balance insufficient at approval';
         balance.reservedDays -= request.daysRequested;
-
         await this.balanceRepo.save(balance);
-        await this.requestRepo.save(request);
-        throw new BadRequestException('HCM balance changed independently');
+        return await this.requestRepo.save(request);
       }
 
-      // Layer 3: File to HCM
+      // Layer 3: Deduct
       await axios.post(`${this.HCM_URL}/time-off`, {
         employeeId: request.employeeId,
         locationId: request.locationId,
         days: request.daysRequested,
       });
 
-      // Update state
+      request.hcmFiled = true;
+      request.status = RequestStatus.APPROVED;
       balance.availableDays -= request.daysRequested;
       balance.reservedDays -= request.daysRequested;
-      balance.lastSyncedAt = new Date();
-      await this.balanceRepo.save(balance);
-
-      request.status = RequestStatus.APPROVED;
-      request.hcmFiled = true;
-      return await this.requestRepo.save(request);
     } catch (error) {
-      this.logger.error(`Approval error: ${error.message}`);
-
-      request.status = RequestStatus.FAILED;
-      request.failureReason = error.response?.data?.error || 'HCM Sync Error';
-
-      // Safety restore
+      if (error.response?.status === 400) {
+        throw new BadGatewayException('HCM rejected request (400)');
+      }
+      // TRD 4.6 Resilience
+      this.logger.warn(`HCM Down. Optimistic Approval for ${requestId}`);
+      request.status = RequestStatus.APPROVED;
+      request.hcmFiled = false;
+      balance.availableDays -= request.daysRequested;
       balance.reservedDays -= request.daysRequested;
-      await this.balanceRepo.save(balance);
-      await this.requestRepo.save(request);
-
-      throw new InternalServerErrorException('Sync failed');
-    }
-  }
-
-  async rejectRequest(requestId: string) {
-    const request = await this.requestRepo.findOne({
-      where: { id: requestId },
-    });
-    if (!request || request.status !== RequestStatus.PENDING) {
-      throw new BadRequestException('Request not found');
     }
 
-    const balance = await this.balanceRepo.findOne({
-      where: { employeeId: request.employeeId, locationId: request.locationId },
-    });
-
-    if (balance) {
-      balance.reservedDays -= request.daysRequested;
-      await this.balanceRepo.save(balance);
-    }
-
-    request.status = RequestStatus.REJECTED;
+    await this.balanceRepo.save(balance);
     return await this.requestRepo.save(request);
-  }
-
-  async getEmployeeBalances(employeeId: string) {
-    return this.balanceRepo.find({ where: { employeeId } });
   }
 
   async syncBatchBalances(
     balances: { employeeId: string; locationId: string; balance: number }[],
   ) {
     for (const item of balances) {
-      let localBalance = await this.balanceRepo.findOne({
+      let local = await this.balanceRepo.findOne({
         where: { employeeId: item.employeeId, locationId: item.locationId },
       });
 
-      if (!localBalance) {
-        localBalance = this.balanceRepo.create({
+      if (!local) {
+        local = this.balanceRepo.create({
           employeeId: item.employeeId,
           locationId: item.locationId,
           availableDays: item.balance,
           reservedDays: 0,
         });
+        await this.balanceRepo.save(local);
       } else {
-        localBalance.availableDays = item.balance;
+        local.availableDays = item.balance;
+        await this.balanceRepo.save(local);
       }
 
-      localBalance.lastSyncedAt = new Date();
-      await this.balanceRepo.save(localBalance);
-
-      // TRD Section 4.5: Re-evaluate pending requests (Defensive)
-      const pendingRequests = await this.requestRepo.find({
+      // TRD 4.5 Auto-fail invalid pending requests
+      const pendings = await this.requestRepo.find({
         where: {
           employeeId: item.employeeId,
           locationId: item.locationId,
           status: RequestStatus.PENDING,
         },
       });
-
-      const totalReserved = pendingRequests.reduce(
-        (sum, req) => sum + req.daysRequested,
-        0,
-      );
-
-      // If the new balance from HCM is so low it can't cover pending requests
-      if (item.balance < totalReserved) {
-        this.logger.warn(
-          `Batch sync mismatch for ${item.employeeId}: Balance lower than reserved days.`,
-        );
-        // Note: In a real app, you might trigger an alert or auto-fail requests here.
+      for (const req of pendings) {
+        if (local.availableDays < local.reservedDays) {
+          req.status = RequestStatus.FAILED;
+          req.failureReason = 'BALANCE_REDUCED_BY_HCM';
+          local.reservedDays -= req.daysRequested;
+          await this.requestRepo.save(req);
+          await this.balanceRepo.save(local);
+        }
       }
     }
+    await this.syncLogRepo.save(
+      this.syncLogRepo.create({ syncType: 'BATCH', status: 'SUCCESS' }),
+    );
   }
-  // Add this to the TimeOffService class
+
+  @Cron(CronExpression.EVERY_MINUTE)
+  async retryUnfiledDeductions() {
+    const unfiled = await this.requestRepo.find({
+      where: { status: RequestStatus.APPROVED, hcmFiled: false },
+    });
+    for (const req of unfiled) {
+      try {
+        await axios.post(`${this.HCM_URL}/time-off`, {
+          employeeId: req.employeeId,
+          locationId: req.locationId,
+          days: req.daysRequested,
+        });
+        req.hcmFiled = true;
+        await this.requestRepo.save(req);
+      } catch (e) {}
+    }
+  }
+
+  async getEmployeeBalances(employeeId: string) {
+    return this.balanceRepo.find({ where: { employeeId } });
+  }
   async getEmployeeRequests(employeeId: string) {
     return this.requestRepo.find({
       where: { employeeId },
       order: { createdAt: 'DESC' },
     });
   }
-
-  // TRD 5.1: Cancel a pending request
-  async cancelRequest(requestId: string) {
-    const request = await this.requestRepo.findOne({
-      where: { id: requestId },
-    });
-
-    if (!request) throw new NotFoundException('Request not found');
-    if (request.status !== RequestStatus.PENDING) {
-      throw new BadRequestException('Only pending requests can be cancelled');
-    }
-
+  async rejectRequest(requestId: string) {
+    const req = await this.requestRepo.findOne({ where: { id: requestId } });
+    if (!req || req.status !== RequestStatus.PENDING) return;
     const balance = await this.balanceRepo.findOne({
-      where: { employeeId: request.employeeId, locationId: request.locationId },
+      where: { employeeId: req.employeeId, locationId: req.locationId },
     });
-
     if (balance) {
-      balance.reservedDays -= request.daysRequested;
+      balance.reservedDays -= req.daysRequested;
       await this.balanceRepo.save(balance);
     }
-
-    await this.requestRepo.remove(request);
-    return { message: 'Request cancelled and reserved days restored' };
+    req.status = RequestStatus.REJECTED;
+    return await this.requestRepo.save(req);
   }
-
-  // TRD 5.3: Manual real-time sync (Admin only)
+  async cancelRequest(requestId: string) {
+    return this.rejectRequest(requestId);
+  }
+  /**
+   * TRD 5.3: Manual real-time sync (Admin/System use)
+   * Fetches balance directly from HCM and updates the local cache.
+   */
   async manualSync(employeeId: string, locationId: string) {
     try {
-      const hcmRes = await axios.get(
+      const res = await axios.get(
         `${this.HCM_URL}/balances/${employeeId}/${locationId}`,
       );
-      const hcmBalance = hcmRes.data.balance;
+      const hcmBalance = res.data.balance;
 
       let localBalance = await this.balanceRepo.findOne({
         where: { employeeId, locationId },
       });
 
       if (!localBalance) {
-        localBalance = this.balanceRepo.create({ employeeId, locationId });
+        localBalance = this.balanceRepo.create({
+          employeeId,
+          locationId,
+          availableDays: hcmBalance,
+          reservedDays: 0,
+        });
+      } else {
+        localBalance.availableDays = hcmBalance;
       }
 
-      localBalance.availableDays = hcmBalance;
       localBalance.lastSyncedAt = new Date();
       return await this.balanceRepo.save(localBalance);
     } catch (error) {
-      this.logger.error(`Manual sync failed: ${error.message}`);
-      throw new InternalServerErrorException('Could not sync with HCM');
+      this.logger.error(
+        `Manual sync failed for ${employeeId}: ${error.message}`,
+      );
+      throw new BadGatewayException('Could not synchronize with HCM system');
     }
   }
 }

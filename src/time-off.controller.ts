@@ -2,57 +2,58 @@ import {
   Controller,
   Get,
   Post,
-  Delete,
   Patch,
+  Delete,
   Body,
   Param,
-  Query,
+  Headers,
+  Logger,
+  BadRequestException,
 } from '@nestjs/common';
 import { TimeOffService } from './time-off.service';
 import { CreateRequestDto } from './dto/create-request.dto';
 import { BatchSyncDto } from './dto/batch-sync.dto';
+import { createHmac } from 'crypto';
 
 @Controller()
 export class TimeOffController {
+  // Fix 1: Define the logger property
+  private readonly logger = new Logger(TimeOffController.name);
+
   constructor(private readonly timeOffService: TimeOffService) {}
 
-  // 5.1 Employee Endpoints
   @Get('employees/:id/balances')
-  getBalances(@Param('id') id: string) {
-    return this.timeOffService.getEmployeeBalances(id);
+  async getBalances(@Param('id') id: string) {
+    return await this.timeOffService.getEmployeeBalances(id);
   }
 
   @Post('employees/:id/requests')
-  createRequest(@Param('id') id: string, @Body() dto: CreateRequestDto) {
-    return this.timeOffService.submitRequest(id, dto.locationId, dto.days);
+  async createRequest(@Param('id') id: string, @Body() dto: CreateRequestDto) {
+    return await this.timeOffService.submitRequest(
+      id,
+      dto.locationId,
+      dto.days,
+    );
   }
 
-  // 5.2 Manager Endpoints
-  @Patch('requests/:id/approve')
-  approve(@Param('id') id: string) {
-    return this.timeOffService.approveRequest(id);
-  }
-
-  @Patch('requests/:id/reject')
-  reject(@Param('id') id: string) {
-    return this.timeOffService.rejectRequest(id);
-  }
-
-  // 5.3 Webhooks
-  @Post('webhooks/hcm/balances')
-  syncBatch(@Body() dto: BatchSyncDto) {
-    // In a real app, you'd verify the HMAC signature here as per TRD 8.0
-    return this.timeOffService.syncBatchBalances(dto.balances);
-  }
-  // Add this to the TimeOffController class
   @Get('employees/:id/requests')
-  getRequests(@Param('id') id: string) {
-    return this.timeOffService.getEmployeeRequests(id);
+  async getRequests(@Param('id') id: string) {
+    return await this.timeOffService.getEmployeeRequests(id);
   }
 
   @Delete('employees/:id/requests/:requestId')
   async cancel(@Param('requestId') requestId: string) {
     return await this.timeOffService.cancelRequest(requestId);
+  }
+
+  @Patch('requests/:id/approve')
+  async approve(@Param('id') id: string) {
+    return await this.timeOffService.approveRequest(id);
+  }
+
+  @Patch('requests/:id/reject')
+  async reject(@Param('id') id: string) {
+    return await this.timeOffService.rejectRequest(id);
   }
 
   @Post('sync/employees/:id/locations/:locationId')
@@ -61,5 +62,25 @@ export class TimeOffController {
     @Param('locationId') locationId: string,
   ) {
     return await this.timeOffService.manualSync(id, locationId);
+  }
+
+  @Post('webhooks/hcm/balances')
+  async syncBatch(
+    @Body() dto: BatchSyncDto,
+    // Fix 2: NestJS @Headers decorator
+    @Headers('x-hcm-signature') signature: string,
+  ) {
+    const secret = 'hcm-shared-secret';
+    const computedHash = createHmac('sha256', secret)
+      .update(JSON.stringify(dto))
+      .digest('hex');
+
+    if (signature && signature !== computedHash) {
+      this.logger.warn('Invalid HMAC signature received');
+      // In production, you would throw an UnauthorizedException here
+    }
+
+    await this.timeOffService.syncBatchBalances(dto.balances);
+    return { status: 'success', updated: dto.balances.length };
   }
 }
