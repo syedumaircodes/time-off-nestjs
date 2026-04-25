@@ -13,19 +13,15 @@ let config = { forceErrorCode: null, delay: 0 };
 const getKey = (id, loc) => `${id}_${loc}`;
 
 app.get('/balances/:empId/:locId', (req, res) => {
-  // TRD 7.3: Handle simulated HCM errors
-  if (config.forceErrorCode) {
-    return res
-      .status(config.forceErrorCode)
-      .json({ error: 'HCM System Error' });
-  }
+  if (config.forceErrorCode)
+    return res.status(config.forceErrorCode).json({ error: 'HCM Error' });
 
-  const key = getKey(req.params.empId, req.params.locId);
-
-  // Default to 10 if unknown to support the "Happy Path" test case seeding
+  const key = `${req.params.empId}_${req.params.locId}`;
   const data = hcmBalances[key] || { balance: 10 };
 
-  setTimeout(() => res.json(data), config.delay);
+  // Use config.forceDelay or config.delay
+  const timeout = config.forceDelay || config.delay || 0;
+  setTimeout(() => res.json(data), timeout);
 });
 
 app.post('/time-off', (req, res) => {
