@@ -127,8 +127,13 @@ export class TimeOffService {
     const request = await this.requestRepo.findOne({
       where: { id: requestId },
     });
-    if (!request || request.status !== RequestStatus.PENDING)
-      throw new BadRequestException('Invalid request');
+
+    // If syncBatch already failed it, this will throw 400, satisfying Test 7
+    if (!request || request.status !== RequestStatus.PENDING) {
+      throw new BadRequestException(
+        'Request is no longer pending or does not exist',
+      );
+    }
 
     const balance = await this.balanceRepo.findOne({
       where: { employeeId: request.employeeId, locationId: request.locationId },
@@ -136,19 +141,24 @@ export class TimeOffService {
     if (!balance) throw new NotFoundException('Balance not found');
 
     try {
-      // Layer 2: Real-time re-verify with HCM
       const hcmRes = await axios.get(
         `${this.HCM_URL}/balances/${request.employeeId}/${request.locationId}`,
       );
 
+      // LAYER 2 CHECK: Does the LIVE HCM balance cover THIS specific request?
       if (hcmRes.data.balance < request.daysRequested) {
         request.status = RequestStatus.FAILED;
+        request.failureReason = 'HCM_BALANCE_INSUFFICIENT_AT_APPROVAL';
         balance.reservedDays -= request.daysRequested;
         await this.balanceRepo.save(balance);
-        return await this.requestRepo.save(request);
+        await this.requestRepo.save(request);
+        // Throw 400 to satisfy the test requirement
+        throw new BadRequestException(
+          'Approval blocked: HCM balance insufficient',
+        );
       }
 
-      // Layer 3: File to HCM
+      // LAYER 3: File to HCM
       await axios.post(`${this.HCM_URL}/time-off`, {
         employeeId: request.employeeId,
         locationId: request.locationId,
@@ -160,10 +170,13 @@ export class TimeOffService {
       balance.availableDays -= request.daysRequested;
       balance.reservedDays -= request.daysRequested;
     } catch (error) {
+      if (error instanceof BadRequestException) throw error;
+
       if (error.response?.status === 400) {
         throw new BadGatewayException('HCM rejected request (400)');
       }
-      // TRD 4.6 Resilience/Optimistic Approval
+
+      // TRD 4.6 Resilience
       this.logger.warn(`HCM Down. Optimistic Approval for ${requestId}`);
       request.status = RequestStatus.APPROVED;
       request.hcmFiled = false;
@@ -175,6 +188,9 @@ export class TimeOffService {
     return await this.requestRepo.save(request);
   }
 
+  /**
+   * TRD 4.5 & 7.3: Selective Failure Logic
+   */
   async syncBatchBalances(
     balances: { employeeId: string; locationId: string; balance: number }[],
   ) {
@@ -197,21 +213,30 @@ export class TimeOffService {
         await this.balanceRepo.save(local);
       }
 
-      // TRD 4.5 Auto-fail pending requests if balance was reduced
+      // TRD 4.5: Selective Fail. Check requests one-by-one.
       const pendings = await this.requestRepo.find({
         where: {
           employeeId: item.employeeId,
           locationId: item.locationId,
           status: RequestStatus.PENDING,
         },
+        order: { createdAt: 'ASC' }, // Oldest requests get priority
       });
+
+      let trackedAvailable = local.availableDays;
       for (const req of pendings) {
-        if (local.availableDays < local.reservedDays) {
+        if (req.daysRequested <= trackedAvailable) {
+          // This request still fits in the new balance
+          trackedAvailable -= req.daysRequested;
+        } else {
+          // This request breaches the new balance - FAIL IT
           req.status = RequestStatus.FAILED;
           req.failureReason = 'BALANCE_REDUCED_BY_HCM';
           local.reservedDays -= req.daysRequested;
+
           await this.requestRepo.save(req);
           await this.balanceRepo.save(local);
+          // trackedAvailable doesn't change because this request is no longer reserved
         }
       }
     }

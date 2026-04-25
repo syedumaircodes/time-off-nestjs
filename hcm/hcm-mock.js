@@ -17,9 +17,9 @@ app.get('/balances/:empId/:locId', (req, res) => {
     return res.status(config.forceErrorCode).json({ error: 'HCM Error' });
 
   const key = `${req.params.empId}_${req.params.locId}`;
+  // If we have a seeded balance, use it. Otherwise, default to 10 for tests.
   const data = hcmBalances[key] || { balance: 10 };
 
-  // Use config.forceDelay or config.delay
   const timeout = config.forceDelay || config.delay || 0;
   setTimeout(() => res.json(data), timeout);
 });

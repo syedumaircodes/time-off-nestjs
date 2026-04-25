@@ -1,53 +1,55 @@
-# 🚀 Time-Off Microservice (ExampleHR)
+# Time-Off Microservice — ExampleHR
 
 - **Author:** Syed Umair Ali
-- **Assignment:** ReadyOn Take-Home Engineering Challenge
-- **Architecture:** Defensive Synchronization & Distributed Consistency
+- **Assignment:** ExampleHR Take-Home Engineering Challenge
+- **Architecture:** Defensive Synchronisation & Distributed Consistency
 
-## 🌟 Executive Summary
+## Executive Summary
 
-This microservice manages employee time-off requests by synchronizing a local state with an external Human Capital Management (HCM) system. Designed for high reliability and consistency, it solves the "Source of Truth" problem using a **3-Layer Validation Strategy** and **Atomic Concurrency Control**.
+This microservice manages the full lifecycle of employee time-off requests while maintaining balance integrity across two systems: ExampleHR's local database and an external Human Capital Management (HCM) system (e.g. Workday, SAP).
 
-## 🛠️ The Tech Stack
+The central challenge is distributed consistency — the HCM is the source of truth, but employees need instant feedback and the system must remain available even when HCM is slow or down. The solution is a **3-Layer Validation Strategy** combined with **Manual Optimistic Locking** and an **Approval-Only Deduction Model**.
 
-- **Framework:** NestJS v11 (Node.js)
-- **Database:** SQLite + TypeORM
-- **Concurrency:** Manual Optimistic Locking (Atomic Update Pattern)
-- **Resilience:** @nestjs/schedule (Cron recovery)
-- **Testing:** Jest + Supertest
+## Tech Stack
 
----
+| Layer       | Technology                                        |
+| ----------- | ------------------------------------------------- |
+| Framework   | NestJS v11 (Node.js)                              |
+| Database    | SQLite + TypeORM                                  |
+| Concurrency | Manual Optimistic Locking (Atomic Update Pattern) |
+| Resilience  | @nestjs/schedule (Cron recovery)                  |
+| Testing     | Jest + Supertest                                  |
 
-## 🏗️ Architectural Key Decisions (Aligned with TRD)
+## Key Architectural Decisions
 
-### 1. Defensive "Reserved Days" Pattern (TRD Section 4.2)
+### 1. Approval-Only HCM Deduction (TRD Section 4.4)
 
-To ensure immediate feedback for employees without risking over-deduction, we implement a "Local Escrow" system.
+HCM is never debited at submission — only at approval. A pending request is an intent, not confirmed leave. This avoids needing a refund/reversal API on HCM for every rejection or cancellation, and keeps HCM free of unconfirmed state.
 
-- **Reserved Days:** When a request is PENDING, days are moved to a `reservedDays` column.
-- **Effective Balance:** Validation is always performed against `availableDays - reservedDays`.
-- This prevents a user from submitting multiple requests that exceed their balance while waiting for manager approval.
+- **Submission:** local Layer 1 pre-check only. `reservedDays` is incremented locally. No HCM call.
+- **Approval:** real-time HCM balance re-fetch (Layer 2) → deduction filed to HCM (Layer 3).
+- **Rejection / Cancellation:** `reservedDays` restored locally. No HCM call required.
 
-### 2. Concurrency Control (TRD Section 4.3)
+### 2. Reserved Days Pattern — Local Escrow (TRD Section 4.2)
 
-We utilize **Manual Optimistic Locking**. By performing atomic updates (`UPDATE ... WHERE version = x`), the system remains non-blocking but guarantees that two simultaneous requests cannot both deduct the same balance. The service includes a retry loop with exponential backoff to handle high-contention scenarios.
+All balance validation runs against `availableDays − reservedDays`, not `availableDays` alone. This prevents an employee from submitting multiple requests that collectively exceed their balance while each is individually awaiting manager approval.
 
-### 3. Graceful Degradation & Resilience (TRD Section 4.6)
+### 3. Manual Optimistic Locking (TRD Section 4.3)
 
-We favor **System Availability**.
+Concurrency is handled via atomic `UPDATE ... WHERE version = :captured` statements. If a concurrent write invalidates the captured version, the operation retries up to 3 times with exponential backoff. On exhaustion it returns `409 Conflict` — deliberately distinct from `400 Bad Request` (validation failure), so callers can distinguish the two failure modes.
 
-- If the HCM is down during approval (500 error), the system "optimistically" approves the request locally but marks it as `hcmFiled = false`.
-- A background **Cron Job** retries these unfiled deductions every minute until the HCM returns to life, ensuring eventual consistency.
-- If the HCM returns a **400 (Data Error)**, the system blocks the approval to prevent data corruption.
+### 4. Graceful Degradation (TRD Section 4.6)
 
-### 4. Idempotency & Audit Trail (TRD Section 8.0)
+Submission is fully decoupled from HCM availability — no HCM call is made at that stage, so employees always get instant feedback regardless of HCM status.
 
-- **Submission Idempotency:** Submitting the same Request UUID multiple times returns the existing record rather than creating duplicates.
-- **Sync Logs:** Every batch sync event is recorded in a `sync_log` table for audit purposes.
+At approval, if the HCM deduction call fails after retries (500 / timeout), the request is saved as `APPROVED` with `hcmFiled = false`. A background cron job retries unfiled deductions every 60 seconds until HCM recovers. A hard `400` from HCM (data error) blocks the approval entirely to prevent data corruption.
 
----
+### 5. Idempotency & Audit Trail (TRD Section 8)
 
-## 🚀 Getting Started
+- Submitting the same request UUID multiple times returns the existing record rather than creating a duplicate.
+- Every batch sync event is recorded in a `sync_log` table for a full audit trail.
+
+## Getting Started
 
 ### 1. Install Dependencies
 
@@ -55,11 +57,9 @@ We favor **System Availability**.
 npm install
 ```
 
-````
+### 2. Start the HCM Mock Server
 
-### 2. Start the HCM Mock Server (Critical)
-
-The microservice requires the mock HCM to be running to simulate real-time synchronization.
+The microservice requires the mock HCM server to be running to simulate real-time synchronisation and failure scenarios.
 
 ```bash
 node hcm-mock.js
@@ -73,53 +73,38 @@ npm run start
 
 The service will be available at `http://localhost:3000`.
 
----
+## Test Suite
 
-## 🧪 Rigorous Testing Suite
+The test suite is structured in four layers as specified in the TRD. Every layer tests a distinct boundary — from pure business logic through to real HTTP calls against the mock HCM server.
 
-The value of this implementation lies in the test suite, which rigorously simulates distributed systems failures.
+| #   | Describe Block                         | Test Name                                                                                                        | TRD Reference |
+| --- | -------------------------------------- | ---------------------------------------------------------------------------------------------------------------- | ------------- |
+| 1   | Balance & Request Lifecycle            | Full happy path: Sync → Submit → Approve, final balance correct                                                  | 7.3           |
+| 2   | Balance & Request Lifecycle            | Submission rejected when effective balance insufficient (Layer 1)                                                | 7.3           |
+| 3   | Concurrency Control                    | Simultaneous over-budget requests — one 201, one 400 (Optimistic Locking)                                        | 3.1 & 4.3     |
+| 4   | Defensive HCM Sync Edge Cases          | Batch sync reduces balance — pending request auto-failed                                                         | 4.5 & 7.3     |
+| 5   | Resilience & Unavailability            | HCM 500 on deduction — optimistic approval, `hcmFiled = false`                                                   | 4.6           |
+| 6   | Unit — Balance Calculation Logic       | `availableDays` unchanged, `reservedDays` incremented at submission; second request blocked by effective balance | 7.2           |
+| 7   | Cancellation & Rejection               | Cancelling PENDING request restores `reservedDays` to zero                                                       | 7.3           |
+| 8   | Layer 2 — Approval Blocked by Re-fetch | Approval returns 400 when HCM live balance is lower than days requested                                          | 4.4           |
+| 9   | Selective Fail on Batch Sync           | 3-day request survives balance drop to 4; 6-day request fails                                                    | 7.3           |
+| 10  | HCM Mock — Additional Errors           | HCM timeout treated same as 500 — request approved, `hcmFiled` pending                                           | 7.3           |
+| 11  | Concurrency — Lock Exhaustion          | 15 simultaneous requests — all responses are 201 or 409, never 500                                               | 3.1 & 4.3     |
 
-**Total Tests: 7/7 Passing**
-
-| Test Case          | TRD Reference | Description                                                   |
-| :----------------- | :------------ | :------------------------------------------------------------ |
-| **Happy Path**     | Section 7.3   | Sync -> Submit -> Approve flow.                               |
-| **Concurrency**    | Section 3.1   | Fires simultaneous requests to prove no double-spending.      |
-| **Defensive Sync** | Section 4.5   | Auto-fails PENDING requests if a Batch Sync reduces balance.  |
-| **Resilience**     | Section 4.6   | Verifies background recovery when HCM is offline.             |
-| **Idempotency**    | Section 8.0   | Proves identical batch payloads don't cause duplicate writes. |
-
-**Run E2E Tests:**
+### Run the Test Suite
 
 ```bash
 npm run test:e2e
 ```
 
-**Generate Coverage Report:**
-
-```bash
-npm run test:cov
-```
-
 ---
 
-## 🤖 Agentic Development Reflection
+## Agentic Development Reflection
 
-This project was developed using an **Agentic Workflow**.
+This project was built using an agentic workflow:
 
-1. **Design First:** A comprehensive TRD was authored to define the system boundaries and failure modes.
-2. **AI Orchestration:** The TRD was used as the master prompt to generate the microservice architecture.
-3. **Iterative Refinement:** Every line of code was reviewed for SQLite-specific limitations (like concurrent write transactions) and refined until the 7/7 "Rigorous Test Suite" reached a 100% pass rate.
+1. **Design first.** A comprehensive Technical Requirements Document (TRD) was authored before a single line of code was written. The TRD defines system boundaries, data model, API contracts, failure modes, and alternative approaches considered.
+2. **AI orchestration.** The TRD was used as the master prompt to generate the NestJS architecture, entity definitions, service logic, and mock HCM server.
+3. **Iterative refinement.** Every generated output was reviewed against the TRD for correctness. Key issues caught during review — including a critical contradiction in when the HCM deduction should occur — were resolved at the design level first, then the code was regenerated to match. The test suite was used to verify behaviour, not just to achieve a pass rate.
 
----
-
-_End of Document — Developed for Syed Umair Ali's Engineering Application._
-
-```
-
-### 💡 Final Pro-Tip for Syed:
-When you zip the file, if you have a folder for your **Postman Collection**, include it in the root! It's an extra touch that shows you really care about the people who will be testing your work.
-
-**You are ready. Go win that role!** 🚀🔥
-```
-````
+The agentic approach worked best when the TRD was precise. Vague prompts produced generic code; precise specifications with explicit failure modes produced robust, correct implementations.
