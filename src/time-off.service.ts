@@ -173,4 +173,57 @@ export class TimeOffService {
   async getEmployeeBalances(employeeId: string) {
     return this.balanceRepo.find({ where: { employeeId } });
   }
+
+  async syncBatchBalances(
+    balances: { employeeId: string; locationId: string; balance: number }[],
+  ) {
+    for (const item of balances) {
+      let localBalance = await this.balanceRepo.findOne({
+        where: { employeeId: item.employeeId, locationId: item.locationId },
+      });
+
+      if (!localBalance) {
+        localBalance = this.balanceRepo.create({
+          employeeId: item.employeeId,
+          locationId: item.locationId,
+          availableDays: item.balance,
+          reservedDays: 0,
+        });
+      } else {
+        localBalance.availableDays = item.balance;
+      }
+
+      localBalance.lastSyncedAt = new Date();
+      await this.balanceRepo.save(localBalance);
+
+      // TRD Section 4.5: Re-evaluate pending requests (Defensive)
+      const pendingRequests = await this.requestRepo.find({
+        where: {
+          employeeId: item.employeeId,
+          locationId: item.locationId,
+          status: RequestStatus.PENDING,
+        },
+      });
+
+      const totalReserved = pendingRequests.reduce(
+        (sum, req) => sum + req.daysRequested,
+        0,
+      );
+
+      // If the new balance from HCM is so low it can't cover pending requests
+      if (item.balance < totalReserved) {
+        this.logger.warn(
+          `Batch sync mismatch for ${item.employeeId}: Balance lower than reserved days.`,
+        );
+        // Note: In a real app, you might trigger an alert or auto-fail requests here.
+      }
+    }
+  }
+  // Add this to the TimeOffService class
+  async getEmployeeRequests(employeeId: string) {
+    return this.requestRepo.find({
+      where: { employeeId },
+      order: { createdAt: 'DESC' },
+    });
+  }
 }
