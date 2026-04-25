@@ -2,6 +2,7 @@ import {
   Controller,
   Get,
   Post,
+  Delete,
   Patch,
   Body,
   Param,
@@ -47,5 +48,18 @@ export class TimeOffController {
   @Get('employees/:id/requests')
   getRequests(@Param('id') id: string) {
     return this.timeOffService.getEmployeeRequests(id);
+  }
+
+  @Delete('employees/:id/requests/:requestId')
+  async cancel(@Param('requestId') requestId: string) {
+    return await this.timeOffService.cancelRequest(requestId);
+  }
+
+  @Post('sync/employees/:id/locations/:locationId')
+  async triggerManualSync(
+    @Param('id') id: string,
+    @Param('locationId') locationId: string,
+  ) {
+    return await this.timeOffService.manualSync(id, locationId);
   }
 }

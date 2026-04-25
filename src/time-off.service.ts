@@ -226,4 +226,53 @@ export class TimeOffService {
       order: { createdAt: 'DESC' },
     });
   }
+
+  // TRD 5.1: Cancel a pending request
+  async cancelRequest(requestId: string) {
+    const request = await this.requestRepo.findOne({
+      where: { id: requestId },
+    });
+
+    if (!request) throw new NotFoundException('Request not found');
+    if (request.status !== RequestStatus.PENDING) {
+      throw new BadRequestException('Only pending requests can be cancelled');
+    }
+
+    const balance = await this.balanceRepo.findOne({
+      where: { employeeId: request.employeeId, locationId: request.locationId },
+    });
+
+    if (balance) {
+      balance.reservedDays -= request.daysRequested;
+      await this.balanceRepo.save(balance);
+    }
+
+    await this.requestRepo.remove(request);
+    return { message: 'Request cancelled and reserved days restored' };
+  }
+
+  // TRD 5.3: Manual real-time sync (Admin only)
+  async manualSync(employeeId: string, locationId: string) {
+    try {
+      const hcmRes = await axios.get(
+        `${this.HCM_URL}/balances/${employeeId}/${locationId}`,
+      );
+      const hcmBalance = hcmRes.data.balance;
+
+      let localBalance = await this.balanceRepo.findOne({
+        where: { employeeId, locationId },
+      });
+
+      if (!localBalance) {
+        localBalance = this.balanceRepo.create({ employeeId, locationId });
+      }
+
+      localBalance.availableDays = hcmBalance;
+      localBalance.lastSyncedAt = new Date();
+      return await this.balanceRepo.save(localBalance);
+    } catch (error) {
+      this.logger.error(`Manual sync failed: ${error.message}`);
+      throw new InternalServerErrorException('Could not sync with HCM');
+    }
+  }
 }
