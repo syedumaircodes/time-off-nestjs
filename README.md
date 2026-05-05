@@ -73,6 +73,38 @@ npm run start
 
 The service will be available at `http://localhost:3000`.
 
+
+## API Surface
+
+### 1. Employee Endpoints
+| Method | Path | Description |
+| :--- | :--- | :--- |
+| **GET** | `/employees/:id/balances` | Returns cached balances. Triggers background HCM refresh if stale (TTL 5m). |
+| **GET** | `/employees/:id/requests` | List all time-off requests for an employee (ordered by newest). |
+| **POST** | `/employees/:id/requests` | Submit a request. Runs **Layer 1** check and increments `reservedDays`. |
+| **DELETE**| `/employees/:id/requests/:requestId` | Cancel a **PENDING** request. Restores `reservedDays` locally. |
+
+**POST `/employees/:id/requests` Body:**
+```json
+{
+  "locationId": "string",
+  "days": number
+}
+```
+
+### 2. Manager Endpoints
+| Method | Path | Description |
+| :--- | :--- | :--- |
+| **PATCH** | `/requests/:id/approve` | Triggers **Layer 2** (HCM re-fetch) and **Layer 3** (HCM deduction). |
+| **PATCH** | `/requests/:id/reject` | Transitions status to REJECTED and restores `reservedDays`. |
+
+### 3. System & Webhook Endpoints
+| Method | Path | Description |
+| :--- | :--- | :--- |
+| **POST** | `/webhooks/hcm/balances` | Batch ingestion from HCM. Processes selective failures and logs sync events. |
+| **POST** | `/sync/employees/:id/locations/:locId` | Admin-only trigger to force a real-time balance refresh from HCM. |
+
+
 ## Test Suite
 
 The test suite is structured in four layers as specified in the TRD. Every layer tests a distinct boundary — from pure business logic through to real HTTP calls against the mock HCM server.
